@@ -83,7 +83,7 @@ def extract_audio_from_video(video_paths):
     return audio_paths
 
 
-def save_face(frame, face,basename):
+def save_face(frame, face, basename):
     """Saves the face from the frame to a jpg file."""
     x, y, w, h = face
     face_image = frame[y : y + h, x : x + w]
@@ -91,7 +91,9 @@ def save_face(frame, face,basename):
     cv2.imwrite(face_output_path, face_image)
 
 
-def extract_webcam_coords(frame, facex, facey,basename):
+prop = 0.85
+    
+def extract_webcam_coords(frame, facex, facey, basename):
     # Calculate the region of interest
     roi_size = int(frame.shape[1] / 4)
     roi_x = facex - roi_size // 2
@@ -113,7 +115,9 @@ def extract_webcam_coords(frame, facex, facey,basename):
     _, threshold = cv2.threshold(gray_roi, 200, 255, cv2.THRESH_BINARY)
 
     # Find contours in the thresholded image
-    contours, _ = cv2.findContours(threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(
+        threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
 
     # Find the largest rectangular contour
     largest_contour = max(contours, key=cv2.contourArea)
@@ -128,19 +132,54 @@ def extract_webcam_coords(frame, facex, facey,basename):
     # Draw the bounding box on the frame
     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-    # Save the image with the bounding box
-    cv2.imwrite('output.jpg', frame)
+    # Calculate the desired aspect ratio
+    target_ratio = 16 / 9
+
+    # Calculate the current aspect ratio
+    current_ratio = w / h
+
+    if current_ratio > target_ratio:
+        # If the current aspect ratio is wider than the target, reduce width
+        new_width = int(h * target_ratio)
+        diff = w - new_width
+        x += diff // 2
+        w = new_width
+    else:
+        # If the current aspect ratio is taller than the target, reduce height
+        new_height = int(w / target_ratio)
+        diff = h - new_height
+        y += diff // 2
+        h = new_height
+
+    # Calculate the zoomed-in dimensions
+    zoomed_width = int(w * prop)
+    zoomed_height = int(h * prop)
+
+    # Calculate the zoomed-in ROI coordinates
+    zoomed_roi_x = x - (zoomed_width - w) // 2
+    zoomed_roi_y = y - (zoomed_height - h) // 2
+    zoomed_roi_x2 = zoomed_roi_x + zoomed_width
+    zoomed_roi_y2 = zoomed_roi_y + zoomed_height
+
+    # Ensure the zoomed-in ROI coordinates are within the frame boundaries
+    zoomed_roi_x = max(0, zoomed_roi_x)
+    zoomed_roi_y = max(0, zoomed_roi_y)
+    zoomed_roi_x2 = min(frame.shape[1], zoomed_roi_x2)
+    zoomed_roi_y2 = min(frame.shape[0], zoomed_roi_y2)
+
+    # Create the zoomed-in ROI
+    zoomed_roi = frame[zoomed_roi_y:zoomed_roi_y2, zoomed_roi_x:zoomed_roi_x2]
+
+    # Save the cropped image with the bounding box
+    cv2.imwrite(f"{basename}_output.jpg", zoomed_roi)
 
     # Return the global coordinates of the bounding box
-    return x, y, w, h
-
-
+    return zoomed_roi_x, zoomed_roi_y, zoomed_width, zoomed_height
 
 def crop_and_add_overlay(input_path, output_path, face_cascade):
-    
     # save on generated folder
-    base_name = os.path.splitext(os.path.basename(input_path))[0] 
- 
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+
     """Crops the input video around a detected face and adds an overlay."""
     cap = cv2.VideoCapture(input_path)
     success, frame = cap.read()
@@ -157,23 +196,20 @@ def crop_and_add_overlay(input_path, output_path, face_cascade):
     logging.info(f"Found {len(faces)} faces in the input video.")
 
     biggest_face = max(faces, key=lambda f: f[2] * f[3])
-    save_face(frame, biggest_face,base_name)
+    save_face(frame, biggest_face, base_name)
 
     # Draw rectangle on the biggest face
     (x, y, w, h) = biggest_face
     cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
 
-    base_name = os.path.splitext(os.path.basename(input_path))[0] 
-    x, y, h, w = extract_webcam_coords(frame, x,y,base_name)
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    x, y, w, h = extract_webcam_coords(frame, x, y, base_name)
     print("Coordinates of the biggest face: ", x, y, w, h)
-    
-    save_face(frame, (x, y, w, h),base_name+"_webcam")
 
+    save_face(frame, (x, y, w, h), base_name + "_webcam")
 
     # Crop the original video to obtain the webcam video
-    webcam_video = ffmpeg.input(input_path).crop(
-        x=x, y=y, width=w, height=h
-    )
+    webcam_video = ffmpeg.input(input_path).crop(x=x, y=y, width=w, height=h)
 
     # save on generated folder# save on generated folder
     webcam_output_path = os.path.join(output_dir, f"{base_name}_webcam_video.mp4")
