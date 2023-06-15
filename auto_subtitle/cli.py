@@ -5,13 +5,74 @@ import argparse
 import warnings
 import tempfile
 from .utils import filename, write_srt
+import cv2
 
 
-def crop_video(input_path, output_path):
-    video = ffmpeg.input(input_path)
-    audio = video.audio
-    video = video.filter("crop", "ih*(9/16)", "ih")
-    ffmpeg.output(video, audio, output_path, crf=21).run()
+def crop_and_add_overlay(input_path, output_path):
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+
+    # Read the input video
+    cap = cv2.VideoCapture(input_path)
+    success, frame = cap.read()
+    if not success:
+        print("Failed to read input video.")
+        return False
+
+    # Detect faces in the first frame
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(
+        gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
+    )
+
+    if len(faces) == 0:
+        print("No faces found in the input video.")
+        return False
+
+    print(f"Found {len(faces)} faces in the input video.")
+
+    # Get the biggest face based on area
+    biggest_face = max(faces, key=lambda f: f[2] * f[3])
+
+    # Draw rectangle on the biggest face
+    (x, y, w, h) = biggest_face
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+
+    # save on generated folder
+    face_output_path = os.path.join(output_path, "biggest_face.jpg")
+    face_image = frame[y : y + h, x : x + w]
+    cv2.imwrite(face_output_path, face_image)
+
+    # Adjust the size of the bounding box to provide a more zoomed-in effect
+    zoom_factor = 0.5
+    x -= int(zoom_factor * w)
+    y -= int(zoom_factor * h)
+    w = int((1 + 2 * zoom_factor) * w)
+    h = int((1 + 2 * zoom_factor) * h)
+
+    # Calculate the position and size of the webcam video
+    webcam_x = x
+    webcam_y = y
+    webcam_width = w
+    webcam_height = h
+
+    # Crop the original video to obtain the webcam video
+    webcam_video = ffmpeg.input(input_path).crop(
+        webcam_width, webcam_height, webcam_x, webcam_y
+    )
+
+    # Crop the input video to the middle
+    cropped_video = ffmpeg.input(input_path).filter("crop", "ih*(9/16)", "ih")
+
+    # Overlay the webcam video on top of the cropped video
+    output_video = cropped_video.overlay(webcam_video, x=0, y=0)
+
+    # Extract the audio from the input video
+    audio = ffmpeg.input(input_path).audio
+
+    # Output the final video with the overlayed webcam video
+    ffmpeg.output(output_video, audio, output_path, crf=21).run(overwrite_output=True)
 
     return True
 
@@ -54,11 +115,15 @@ def get_subtitles(audio_paths, output_srt, output_dir, transcribe):
     return subtitles_path
 
 
-def process_videos(input_dir, model_name, output_dir, output_srt, srt_only, language, task):
+def process_videos(
+    input_dir, model_name, output_dir, output_srt, srt_only, language, task
+):
     os.makedirs(output_dir, exist_ok=True)
 
     if model_name.endswith(".en"):
-        warnings.warn(f"{model_name} is an English-only model, forcing English detection.")
+        warnings.warn(
+            f"{model_name} is an English-only model, forcing English detection."
+        )
         language = "en"
     elif language != "auto":
         language = language
@@ -89,7 +154,7 @@ def process_videos(input_dir, model_name, output_dir, output_srt, srt_only, lang
         cropped_path = os.path.join(output_dir, f"{filename(path)}_cropped.mp4")
 
         # Crop video to TikTok format
-        crop_video(path, cropped_path)
+        crop_and_add_overlay(path, cropped_path)
 
         print(f"Adding subtitles to {filename(path)}...")
 
