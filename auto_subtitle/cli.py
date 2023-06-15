@@ -1,72 +1,190 @@
 import os
 import ffmpeg
-import whisper
 import argparse
-import warnings
+import logging
 import tempfile
-from .utils import filename, write_srt
 import cv2
+from typing import Iterator, TextIO
 
 
-def crop_and_add_overlay(input_path, output_path):
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
+def str2bool(string):
+    string = string.lower()
+    str2val = {"true": True, "false": False}
 
-    # Read the input video
-    cap = cv2.VideoCapture(input_path)
-    success, frame = cap.read()
-    if not success:
-        print("Failed to read input video.")
-        return False
+    if string in str2val:
+        return str2val[string]
+    else:
+        raise ValueError(f"Expected one of {set(str2val.keys())}, got {string}")
 
-    # Detect faces in the first frame
+
+def format_timestamp(seconds: float, always_include_hours: bool = False):
+    assert seconds >= 0, "non-negative timestamp expected"
+    milliseconds = round(seconds * 1000.0)
+
+    hours = milliseconds // 3_600_000
+    milliseconds -= hours * 3_600_000
+
+    minutes = milliseconds // 60_000
+    milliseconds -= minutes * 60_000
+
+    seconds = milliseconds // 1_000
+    milliseconds -= seconds * 1_000
+
+    hours_marker = f"{hours}:" if always_include_hours or hours > 0 else ""
+    return f"{hours_marker}{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+
+
+def write_srt(transcript: Iterator[dict], file: TextIO):
+    for i, segment in enumerate(transcript, start=1):
+        print(
+            f"{i}\n"
+            f"{format_timestamp(segment['start'], always_include_hours=True)} --> "
+            f"{format_timestamp(segment['end'], always_include_hours=True)}\n"
+            f"{segment['text'].strip().replace('-->', '->')}\n",
+            file=file,
+            flush=True,
+        )
+
+
+def filename(path):
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+try:
+    import whisper
+except ImportError as e:
+    logging.error("Error importing 'whisper'. Please make sure it is installed.", e)
+    exit(1)
+
+
+output_dir = "./output"  # changed to "./output"
+logging.basicConfig(level=logging.INFO)
+
+
+def detect_faces(frame, face_cascade):
+    """Detect faces in the frame using provided cascade classifier."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(
+    return face_cascade.detectMultiScale(
         gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
     )
 
-    if len(faces) == 0:
-        print("No faces found in the input video.")
+
+def extract_audio_from_video(video_paths):
+    """Extracts audio from video files."""
+    temp_dir = tempfile.gettempdir()
+    audio_paths = {}
+    for path in video_paths:
+        logging.info(f"Extracting audio from {filename(path)}...")
+        output_path = os.path.join(temp_dir, f"{filename(path)}.wav")
+        ffmpeg.input(path).output(output_path, acodec="pcm_s16le", ac=1, ar="16k").run(
+            quiet=True, overwrite_output=True
+        )
+        audio_paths[path] = output_path
+    return audio_paths
+
+
+def save_face(frame, face,basename):
+    """Saves the face from the frame to a jpg file."""
+    x, y, w, h = face
+    face_image = frame[y : y + h, x : x + w]
+    face_output_path = os.path.join(output_dir, f"{basename}_face.jpg")
+    cv2.imwrite(face_output_path, face_image)
+
+
+def extract_webcam_coords(frame, facex, facey,basename):
+    # Calculate the region of interest
+    roi_size = int(frame.shape[1] / 4)
+    roi_x = facex - roi_size // 2
+    roi_y = facey - roi_size // 2
+
+    # Ensure the ROI coordinates are within the frame boundaries
+    roi_x = max(0, roi_x)
+    roi_y = max(0, roi_y)
+    roi_x2 = min(frame.shape[1], roi_x + roi_size)
+    roi_y2 = min(frame.shape[0], roi_y + roi_size)
+
+    # Create the ROI
+    roi = frame[roi_y:roi_y2, roi_x:roi_x2]
+
+    # Convert the ROI to grayscale
+    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    # Perform thresholding to detect white rectangular boxes
+    _, threshold = cv2.threshold(gray_roi, 200, 255, cv2.THRESH_BINARY)
+
+    # Find contours in the thresholded image
+    contours, _ = cv2.findContours(threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Find the largest rectangular contour
+    largest_contour = max(contours, key=cv2.contourArea)
+
+    # Get the bounding box coordinates of the largest contour
+    x, y, w, h = cv2.boundingRect(largest_contour)
+
+    # Convert the local coordinates to global coordinates
+    x += roi_x
+    y += roi_y
+
+    # Draw the bounding box on the frame
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+    # Save the image with the bounding box
+    cv2.imwrite('output.jpg', frame)
+
+    # Return the global coordinates of the bounding box
+    return x, y, w, h
+
+
+
+def crop_and_add_overlay(input_path, output_path, face_cascade):
+    
+    # save on generated folder
+    base_name = os.path.splitext(os.path.basename(input_path))[0] 
+ 
+    """Crops the input video around a detected face and adds an overlay."""
+    cap = cv2.VideoCapture(input_path)
+    success, frame = cap.read()
+    if not success:
+        logging.error("Failed to read input video.")
         return False
 
-    print(f"Found {len(faces)} faces in the input video.")
+    faces = detect_faces(frame, face_cascade)
 
-    # Get the biggest face based on area
+    if len(faces) == 0:
+        logging.warning("No faces found in the input video.")
+        return False
+
+    logging.info(f"Found {len(faces)} faces in the input video.")
+
     biggest_face = max(faces, key=lambda f: f[2] * f[3])
+    save_face(frame, biggest_face,base_name)
 
     # Draw rectangle on the biggest face
     (x, y, w, h) = biggest_face
     cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
 
-    # save on generated folder
-    face_output_path = os.path.join(output_path, "biggest_face.jpg")
-    face_image = frame[y : y + h, x : x + w]
-    cv2.imwrite(face_output_path, face_image)
+    base_name = os.path.splitext(os.path.basename(input_path))[0] 
+    x, y, h, w = extract_webcam_coords(frame, x,y,base_name)
+    print("Coordinates of the biggest face: ", x, y, w, h)
+    
+    save_face(frame, (x, y, w, h),base_name+"_webcam")
 
-    # Adjust the size of the bounding box to provide a more zoomed-in effect
-    zoom_factor = 0.5
-    x -= int(zoom_factor * w)
-    y -= int(zoom_factor * h)
-    w = int((1 + 2 * zoom_factor) * w)
-    h = int((1 + 2 * zoom_factor) * h)
-
-    # Calculate the position and size of the webcam video
-    webcam_x = x
-    webcam_y = y
-    webcam_width = w
-    webcam_height = h
 
     # Crop the original video to obtain the webcam video
     webcam_video = ffmpeg.input(input_path).crop(
-        webcam_width, webcam_height, webcam_x, webcam_y
+        x=x, y=y, width=w, height=h
     )
+
+    # save on generated folder# save on generated folder
+    webcam_output_path = os.path.join(output_dir, f"{base_name}_webcam_video.mp4")
+
+    ffmpeg.output(webcam_video, webcam_output_path).run(overwrite_output=True)
 
     # Crop the input video to the middle
     cropped_video = ffmpeg.input(input_path).filter("crop", "ih*(9/16)", "ih")
 
     # Overlay the webcam video on top of the cropped video
-    output_video = cropped_video.overlay(webcam_video, x=0, y=0)
+    output_video = cropped_video.overlay(webcam_video, x=x, y=y)
 
     # Extract the audio from the input video
     audio = ffmpeg.input(input_path).audio
@@ -94,21 +212,36 @@ def get_audio(paths):
     return audio_paths
 
 
-def get_subtitles(audio_paths, output_srt, output_dir, transcribe):
+def get_subtitles(audio_paths, input_dir, transcribe):
     subtitles_path = {}
 
     for path, audio_path in audio_paths.items():
-        srt_path = output_dir if output_srt else tempfile.gettempdir()
-        srt_path = os.path.join(srt_path, f"{filename(path)}.srt")
+        srt_path = os.path.join(output_dir, f"{filename(path)}.srt")
 
-        print(f"Generating subtitles for {filename(path)}... This might take a while.")
+        logging.info(f"srt_path: {srt_path}")
 
-        warnings.filterwarnings("ignore")
-        result = transcribe(audio_path)
-        warnings.filterwarnings("default")
+        # Check if SRT file already exists
+        if os.path.exists(srt_path):
+            logging.info(f"Subtitle file already exists: {srt_path}")
+        else:
+            logging.info(
+                f"Generating subtitles for {filename(path)}... This might take a while."
+            )
 
-        with open(srt_path, "w", encoding="utf-8") as srt:
-            write_srt(result["segments"], file=srt)
+            result = transcribe(audio_path)
+
+            # Check if result is not None before attempting to use it
+            if result is not None and "segments" in result:
+                try:
+                    with open(srt_path, "w", encoding="utf-8") as srt:
+                        write_srt(result["segments"], file=srt)
+                    logging.info(f"Subtitle file saved: {srt_path}")
+                except Exception as e:
+                    logging.error(
+                        f"Error saving subtitles to file: {srt_path}. Error: {str(e)}"
+                    )
+            else:
+                logging.error(f"Error generating subtitles for {filename(path)}.")
 
         subtitles_path[path] = srt_path
 
@@ -116,19 +249,31 @@ def get_subtitles(audio_paths, output_srt, output_dir, transcribe):
 
 
 def process_videos(
-    input_dir, model_name, output_dir, output_srt, srt_only, language, task
+    input_dir,
+    model_name,
+    output_srt,
+    srt_only,
+    language,
+    task,
+    face_cascade,
 ):
-    os.makedirs(output_dir, exist_ok=True)
+    # Check if input directory exists
+    if not os.path.isdir(input_dir):
+        logging.error(f"Input directory does not exist: {input_dir}")
+        exit(1)
+
+    # Create output directories
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except Exception as e:
+        logging.error(f"Error creating output directory: {str(e)}")
+        exit(1)
 
     if model_name.endswith(".en"):
-        warnings.warn(
-            f"{model_name} is an English-only model, forcing English detection."
-        )
         language = "en"
     elif language != "auto":
         language = language
 
-    model = whisper.load_model(model_name)
     videos = [
         os.path.join(input_dir, file)
         for file in os.listdir(input_dir)
@@ -137,24 +282,24 @@ def process_videos(
     audios = get_audio(videos)
     subtitles = get_subtitles(
         audios,
-        output_srt or srt_only,
-        output_dir,
-        lambda audio_path: model.transcribe(audio_path, task=task, language=language),
+        input_dir,
+        lambda audio_path: whisper.load_model(model_name).transcribe(
+            audio_path, task=task, language=language
+        ),
     )
 
     if srt_only:
         return
 
     for path, srt_path in subtitles.items():
-        out_path = os.path.join(output_dir, f"{filename(path)}.mp4")
-
+        out_path = os.path.join(output_dir, f"{filename(path)}_result.mp4")
         print(f"Cropping video to TikTok format: {filename(path)}...")
 
         # Create a temporary cropped video file
         cropped_path = os.path.join(output_dir, f"{filename(path)}_cropped.mp4")
 
         # Crop video to TikTok format
-        crop_and_add_overlay(path, cropped_path)
+        crop_and_add_overlay(path, cropped_path, face_cascade)
 
         print(f"Adding subtitles to {filename(path)}...")
 
@@ -217,14 +362,19 @@ def main():
 
     args = parser.parse_args()
 
+    # Load Haar cascades only once
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+
     process_videos(
         args.input_dir,
         args.model,
-        "./generated",
         args.output_srt,
         args.srt_only,
         args.language,
         args.task,
+        face_cascade,
     )
 
 
