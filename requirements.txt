@@ -1,3 +1,4 @@
 openai-whisper
 moviepy
 opencv-python
+ffmpeg-python
